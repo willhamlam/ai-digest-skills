@@ -1,20 +1,19 @@
-import { writeFile, mkdir } from 'node:fs/promises';
-import { dirname } from 'node:path';
+import { writeFile, mkdir, readFile } from 'node:fs/promises';
+import { dirname, resolve } from 'node:path';
 import process from 'node:process';
 
 // ============================================================================
 // Constants
 // ============================================================================
 
-const ANTHROPIC_BASE_URL = 'https://v3.codesome.cn';
+function getAnthropicBaseUrl(): string {
+  return (process.env.ANTHROPIC_API_BASE || 'https://api.anthropic.com').replace(/\/+$/, '');
+}
 const ANTHROPIC_MODEL = 'claude-haiku-4-5-20251001';
-const GEMINI_API_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent';
-const OPENAI_DEFAULT_API_BASE = 'https://api.openai.com/v1';
-const OPENAI_DEFAULT_MODEL = 'gpt-4o-mini';
 const FEED_FETCH_TIMEOUT_MS = 15_000;
 const FEED_CONCURRENCY = 10;
-const GEMINI_BATCH_SIZE = 10;
-const MAX_CONCURRENT_GEMINI = 2;
+const AI_BATCH_SIZE = 10;
+const MAX_CONCURRENT_AI = 2;
 
 // 90 RSS feeds from Hacker News Popularity Contest 2025 (curated by Karpathy)
 const RSS_FEEDS: Array<{ name: string; xmlUrl: string; htmlUrl: string }> = [
@@ -113,6 +112,31 @@ const RSS_FEEDS: Array<{ name: string; xmlUrl: string; htmlUrl: string }> = [
 ];
 
 // ============================================================================
+// .env loader (runtime fallback)
+// ============================================================================
+
+async function loadEnvFile(): Promise<void> {
+  const scriptDir = dirname(new URL(import.meta.url).pathname);
+  const envPath = resolve(scriptDir, '..', '.env');
+  try {
+    const content = await readFile(envPath, 'utf-8');
+    for (const line of content.split('\n')) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#')) continue;
+      const eqIndex = trimmed.indexOf('=');
+      if (eqIndex === -1) continue;
+      const key = trimmed.slice(0, eqIndex).trim();
+      const value = trimmed.slice(eqIndex + 1).trim();
+      if (!process.env[key]) {
+        process.env[key] = value;
+      }
+    }
+  } catch {
+    // .env 不存在时静默跳过
+  }
+}
+
+// ============================================================================
 // Types
 // ============================================================================
 
@@ -150,7 +174,7 @@ interface ScoredArticle extends Article {
   reason: string;
 }
 
-interface GeminiScoringResult {
+interface ScoringResult {
   results: Array<{
     index: number;
     relevance: number;
@@ -161,7 +185,7 @@ interface GeminiScoringResult {
   }>;
 }
 
-interface GeminiSummaryResult {
+interface SummaryResult {
   results: Array<{
     index: number;
     titleZh: string;
@@ -368,7 +392,7 @@ async function fetchAllFeeds(feeds: typeof RSS_FEEDS): Promise<Article[]> {
 }
 
 // ============================================================================
-// AI Providers (Gemini + OpenAI-compatible fallback)
+// AI Provider (Anthropic Claude)
 // ============================================================================
 
 async function callAnthropic(prompt: string, apiKey: string, system?: string): Promise<string> {
@@ -381,7 +405,7 @@ async function callAnthropic(prompt: string, apiKey: string, system?: string): P
   if (system) {
     body.system = system;
   }
-  const response = await fetch(`${ANTHROPIC_BASE_URL}/v1/messages`, {
+  const response = await fetch(`${getAnthropicBaseUrl()}/v1/messages`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -393,7 +417,8 @@ async function callAnthropic(prompt: string, apiKey: string, system?: string): P
   
   if (!response.ok) {
     const errorText = await response.text().catch(() => 'Unknown error');
-    throw new Error(`Anthropic API error (${response.status}): ${errorText}`);
+    const sanitized = errorText.slice(0, 500).replace(/sk-[a-zA-Z0-9_-]+/g, 'sk-***');
+    throw new Error(`Anthropic API error (${response.status}): ${sanitized}`);
   }
 
   // 先读取原始文本，防止代理返回非 JSON 响应
@@ -413,100 +438,10 @@ async function callAnthropic(prompt: string, apiKey: string, system?: string): P
   return data.content?.[0]?.text || '';
 }
 
-async function callOpenAICompatible(
-  prompt: string,
-  apiKey: string,
-  apiBase: string,
-  model: string
-): Promise<string> {
-  const normalizedBase = apiBase.replace(/\/+$/, '');
-  const response = await fetch(`${normalizedBase}/chat/completions`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${apiKey}`,
-    },
-    body: JSON.stringify({
-      model,
-      messages: [{ role: 'user', content: prompt }],
-      temperature: 0.3,
-      top_p: 0.8,
-    }),
-  });
-
-  if (!response.ok) {
-    const errorText = await response.text().catch(() => 'Unknown error');
-    throw new Error(`OpenAI-compatible API error (${response.status}): ${errorText}`);
-  }
-
-  const data = await response.json() as {
-    choices?: Array<{
-      message?: {
-        content?: string | Array<{ type?: string; text?: string }>;
-      };
-    }>;
-  };
-
-  const content = data.choices?.[0]?.message?.content;
-  if (typeof content === 'string') return content;
-  if (Array.isArray(content)) {
-    return content
-      .filter(item => item.type === 'text' && typeof item.text === 'string')
-      .map(item => item.text)
-      .join('\n');
-  }
-  return '';
-}
-
-function inferOpenAIModel(apiBase: string): string {
-  const base = apiBase.toLowerCase();
-  if (base.includes('deepseek')) return 'deepseek-chat';
-  return OPENAI_DEFAULT_MODEL;
-}
-
-function createAIClient(config: {
-  anthropicApiKey?: string;
-  openaiApiKey?: string;
-  openaiApiBase?: string;
-  openaiModel?: string;
-}): AIClient {
-  const state = {
-    anthropicApiKey: config.anthropicApiKey?.trim() || '',
-    openaiApiKey: config.openaiApiKey?.trim() || '',
-    openaiApiBase: (config.openaiApiBase?.trim() || OPENAI_DEFAULT_API_BASE).replace(/\/+$/, ''),
-    openaiModel: config.openaiModel?.trim() || '',
-    anthropicEnabled: Boolean(config.anthropicApiKey?.trim()),
-    fallbackLogged: false,
-  };
-
-  if (!state.openaiModel) {
-    state.openaiModel = inferOpenAIModel(state.openaiApiBase);
-  }
-
+function createAIClient(anthropicApiKey: string): AIClient {
   return {
     async call(prompt: string, system?: string): Promise<string> {
-      if (state.anthropicEnabled && state.anthropicApiKey) {
-        try {
-          return await callAnthropic(prompt, state.anthropicApiKey, system);
-        } catch (error) {
-          if (state.openaiApiKey) {
-            if (!state.fallbackLogged) {
-              const reason = error instanceof Error ? error.message : String(error);
-              console.warn(`[digest] Anthropic failed, switching to OpenAI-compatible fallback (${state.openaiApiBase}, model=${state.openaiModel}). Reason: ${reason}`);
-              state.fallbackLogged = true;
-            }
-            state.anthropicEnabled = false;
-            return callOpenAICompatible(prompt, state.openaiApiKey, state.openaiApiBase, state.openaiModel);
-          }
-          throw error;
-        }
-      }
-
-      if (state.openaiApiKey) {
-        return callOpenAICompatible(prompt, state.openaiApiKey, state.openaiApiBase, state.openaiModel);
-      }
-
-      throw new Error('No AI API key configured. Set ANTHROPIC_API_KEY and/or OPENAI_API_KEY.');
+      return callAnthropic(prompt, anthropicApiKey, system);
     },
   };
 }
@@ -675,21 +610,21 @@ async function scoreArticlesWithAI(
   }));
   
   const batches: typeof indexed[] = [];
-  for (let i = 0; i < indexed.length; i += GEMINI_BATCH_SIZE) {
-    batches.push(indexed.slice(i, i + GEMINI_BATCH_SIZE));
+  for (let i = 0; i < indexed.length; i += AI_BATCH_SIZE) {
+    batches.push(indexed.slice(i, i + AI_BATCH_SIZE));
   }
   
   console.log(`[digest] AI scoring: ${articles.length} articles in ${batches.length} batches`);
   
   const validCategories = new Set<string>(['ai-ml', 'security', 'engineering', 'tools', 'opinion', 'other']);
   
-  for (let i = 0; i < batches.length; i += MAX_CONCURRENT_GEMINI) {
-    const batchGroup = batches.slice(i, i + MAX_CONCURRENT_GEMINI);
+  for (let i = 0; i < batches.length; i += MAX_CONCURRENT_AI) {
+    const batchGroup = batches.slice(i, i + MAX_CONCURRENT_AI);
     const promises = batchGroup.map(async (batch) => {
       try {
         const prompt = buildScoringPrompt(batch);
         const responseText = await aiClient.call(prompt);
-        const parsed = parseJsonResponse<GeminiScoringResult>(responseText);
+        const parsed = parseJsonResponse<ScoringResult>(responseText);
         
         if (parsed.results && Array.isArray(parsed.results)) {
           for (const result of parsed.results) {
@@ -713,7 +648,7 @@ async function scoreArticlesWithAI(
     });
     
     await Promise.all(promises);
-    console.log(`[digest] Scoring progress: ${Math.min(i + MAX_CONCURRENT_GEMINI, batches.length)}/${batches.length} batches`);
+    console.log(`[digest] Scoring progress: ${Math.min(i + MAX_CONCURRENT_AI, batches.length)}/${batches.length} batches`);
   }
   
   return allScores;
@@ -786,14 +721,14 @@ async function summarizeArticles(
   }));
   
   const batches: typeof indexed[] = [];
-  for (let i = 0; i < indexed.length; i += GEMINI_BATCH_SIZE) {
-    batches.push(indexed.slice(i, i + GEMINI_BATCH_SIZE));
+  for (let i = 0; i < indexed.length; i += AI_BATCH_SIZE) {
+    batches.push(indexed.slice(i, i + AI_BATCH_SIZE));
   }
   
   console.log(`[digest] Generating summaries for ${articles.length} articles in ${batches.length} batches`);
   
-  for (let i = 0; i < batches.length; i += MAX_CONCURRENT_GEMINI) {
-    const batchGroup = batches.slice(i, i + MAX_CONCURRENT_GEMINI);
+  for (let i = 0; i < batches.length; i += MAX_CONCURRENT_AI) {
+    const batchGroup = batches.slice(i, i + MAX_CONCURRENT_AI);
     const promises = batchGroup.map(async (batch) => {
       const systemMsg = 'You are a JSON API. Return ONLY a valid JSON object. No markdown, no explanation, no text before or after the JSON.';
       let attempts = 0;
@@ -801,7 +736,7 @@ async function summarizeArticles(
         try {
           const prompt = buildSummaryPrompt(batch, lang);
           const responseText = await aiClient.call(prompt, systemMsg);
-          const parsed = parseJsonResponse<GeminiSummaryResult>(responseText);
+          const parsed = parseJsonResponse<SummaryResult>(responseText);
 
           if (parsed.results && Array.isArray(parsed.results)) {
             for (const result of parsed.results) {
@@ -828,7 +763,7 @@ async function summarizeArticles(
     });
     
     await Promise.all(promises);
-    console.log(`[digest] Summary progress: ${Math.min(i + MAX_CONCURRENT_GEMINI, batches.length)}/${batches.length} batches`);
+    console.log(`[digest] Summary progress: ${Math.min(i + MAX_CONCURRENT_AI, batches.length)}/${batches.length} batches`);
   }
   
   return summaries;
@@ -1119,10 +1054,8 @@ Options:
   --help          Show this help
 
 Environment:
-  ANTHROPIC_API_KEY  Required. Get one at https://v3.codesome.cn
-  OPENAI_API_KEY     Optional fallback key for OpenAI-compatible APIs
-  OPENAI_API_BASE    Optional fallback base URL (default: https://api.openai.com/v1)
-  OPENAI_MODEL       Optional fallback model (default: deepseek-chat for DeepSeek base, else gpt-4o-mini)
+  ANTHROPIC_API_KEY   Required. Get one at https://console.anthropic.com
+  ANTHROPIC_API_BASE  Optional custom API base URL (default: https://api.anthropic.com)
 
 Examples:
   bun scripts/digest.ts --hours 24 --top-n 10 --lang zh
@@ -1132,6 +1065,7 @@ Examples:
 }
 
 async function main(): Promise<void> {
+  await loadEnvFile();
   const args = process.argv.slice(2);
   if (args.includes('--help') || args.includes('-h')) printUsage();
   
@@ -1153,27 +1087,33 @@ async function main(): Promise<void> {
     }
   }
   
-  const anthropicApiKey = process.env.ANTHROPIC_API_KEY;
-  const openaiApiKey = process.env.OPENAI_API_KEY;
-  const openaiApiBase = process.env.OPENAI_API_BASE;
-  const openaiModel = process.env.OPENAI_MODEL;
-
-  if (!anthropicApiKey && !openaiApiKey) {
-    console.error('[digest] Error: Missing API key. Set ANTHROPIC_API_KEY and/or OPENAI_API_KEY.');
-    console.error('[digest] Anthropic key: https://v3.codesome.cn');
+  if (isNaN(hours) || hours <= 0 || hours > 8760) {
+    console.error('[digest] Error: --hours must be between 1 and 8760');
+    process.exit(1);
+  }
+  if (isNaN(topN) || topN <= 0 || topN > 100) {
+    console.error('[digest] Error: --top-n must be between 1 and 100');
+    process.exit(1);
+  }
+  if (lang !== 'zh' && lang !== 'en') {
+    console.error('[digest] Error: --lang must be "zh" or "en"');
     process.exit(1);
   }
 
-  const aiClient = createAIClient({
-    anthropicApiKey,
-    openaiApiKey,
-    openaiApiBase,
-    openaiModel,
-  });
+  const anthropicApiKey = process.env.ANTHROPIC_API_KEY;
+
+  if (!anthropicApiKey) {
+    console.error('[digest] Error: ANTHROPIC_API_KEY not set.');
+    console.error('[digest] Get one at https://console.anthropic.com');
+    process.exit(1);
+  }
+
+  const aiClient = createAIClient(anthropicApiKey);
 
   if (!outputPath) {
     const dateStr = new Date().toISOString().slice(0, 10).replace(/-/g, '');
-    outputPath = `./digest-${dateStr}.md`;
+    const outDir = process.env.DIGEST_OUTPUT_DIR || '.';
+    outputPath = `${outDir}/digest-${dateStr}.md`;
   }
 
   console.log(`[digest] === AI Daily Digest ===`);
@@ -1181,12 +1121,7 @@ async function main(): Promise<void> {
   console.log(`[digest] Top N: ${topN}`);
   console.log(`[digest] Language: ${lang}`);
   console.log(`[digest] Output: ${outputPath}`);
-  console.log(`[digest] AI provider: ${anthropicApiKey ? 'Anthropic (primary)' : 'OpenAI-compatible (primary)'}`);
-  if (openaiApiKey) {
-    const resolvedBase = (openaiApiBase?.trim() || OPENAI_DEFAULT_API_BASE).replace(/\/+$/, '');
-    const resolvedModel = openaiModel?.trim() || inferOpenAIModel(resolvedBase);
-    console.log(`[digest] Fallback: ${resolvedBase} (model=${resolvedModel})`);
-  }
+  console.log(`[digest] AI provider: Anthropic (${ANTHROPIC_MODEL})`);
   console.log('');
   
   console.log(`[digest] Step 1/5: Fetching ${RSS_FEEDS.length} RSS feeds...`);

@@ -1,5 +1,5 @@
 ---
-name: ai-daily-digest
+name: ai-daily-digest-custom
 description: "Fetches RSS feeds from 90 top Hacker News blogs (curated by Karpathy), uses AI to score and filter articles, and generates a daily digest in Markdown with Chinese-translated titles, category grouping, trend highlights, and visual statistics (Mermaid charts + tag cloud). Use when user mentions 'daily digest', 'RSS digest', 'blog digest', 'AI blogs', 'tech news summary', or asks to run /digest command. Trigger command: /digest."
 ---
 
@@ -47,6 +47,7 @@ Agent 在执行前**必须检查**此文件是否存在：
 ```json
 {
   "anthropicApiKey": "",
+  "anthropicApiBase": "",
   "timeRange": 48,
   "topN": 15,
   "language": "zh",
@@ -58,7 +59,19 @@ Agent 在执行前**必须检查**此文件是否存在：
 
 ## 交互流程
 
-### Step 0: 检查已保存配置
+### Step 0: 加载环境变量
+
+检查 `${SKILL_DIR}/.env` 是否存在，如果存在则读取其中的环境变量：
+
+```bash
+cat ${SKILL_DIR}/.env 2>/dev/null || echo "NO_ENV_FILE"
+```
+
+如果 `.env` 存在且包含 `ANTHROPIC_API_KEY`，在 Step 2 执行脚本时使用这些值。
+如果 `.env` 中同时包含 `ANTHROPIC_API_BASE`，也一并使用。
+如果 `.env` 中包含 `DIGEST_OUTPUT_DIR`，在 Step 2 中用作输出目录。
+
+### Step 0b: 检查已保存配置
 
 ```bash
 cat ~/.hn-daily-digest/config.json 2>/dev/null || echo "NO_CONFIG"
@@ -117,15 +130,17 @@ question({
 })
 ```
 
-### Step 1b: AI API Key（Anthropic 优先，支持兜底）
+### Step 1b: AI API Key（Anthropic）
 
-如果配置中没有已保存的 API Key，询问：
+如果 `.env` 中已包含 `ANTHROPIC_API_KEY`，或配置中已有 `anthropicApiKey`，跳过此步。
+
+否则询问：
 
 ```
 question({
   questions: [{
     header: "Anthropic API Key",
-    question: "推荐提供 Anthropic API Key 作为主模型（可选再配置 OPENAI_API_KEY 兜底）\n\n获取方式：访问 https://v3.codesome.cn 获取 API Key",
+    question: "请提供 Anthropic API Key\n\n获取方式：访问 https://console.anthropic.com 获取 API Key",
     options: []
   }]
 })
@@ -136,19 +151,21 @@ question({
 ### Step 2: 执行脚本
 
 ```bash
-mkdir -p ./output
+# 从 .env 读取输出目录，若未设置则默认 ./output
+OUTPUT_DIR="${DIGEST_OUTPUT_DIR:-./output}"
+mkdir -p "$OUTPUT_DIR"
 
+# 从 ${SKILL_DIR}/.env 或 config 中获取的值
 export ANTHROPIC_API_KEY="<key>"
-# 可选：OpenAI 兼容兜底（DeepSeek/OpenAI 等）
-export OPENAI_API_KEY="<fallback-key>"
-export OPENAI_API_BASE="https://api.deepseek.com/v1"
-export OPENAI_MODEL="deepseek-chat"
+# 可选：自定义 API 端点（从 .env 或 config 获取，默认 https://api.anthropic.com）
+export ANTHROPIC_API_BASE="<base_url_if_set>"
+export DIGEST_OUTPUT_DIR="$OUTPUT_DIR"
 
 npx -y bun ${SKILL_DIR}/scripts/digest.ts \
   --hours <timeRange> \
   --top-n <topN> \
   --lang <zh|en> \
-  --output ./output/digest-$(date +%Y%m%d).md
+  --output ${OUTPUT_DIR}/digest-$(date +%Y%m%d).md
 ```
 
 ### Step 2b: 保存配置
@@ -207,8 +224,9 @@ EOF
 ## 环境要求
 
 - `bun` 运行时（通过 `npx -y bun` 自动安装）
-- 至少一个 AI API Key（`ANTHROPIC_API_KEY` 或 `OPENAI_API_KEY`）
-- 可选：`OPENAI_API_BASE`、`OPENAI_MODEL`（用于 OpenAI 兼容接口）
+- `ANTHROPIC_API_KEY`（必需）
+- 可选：`ANTHROPIC_API_BASE`（自定义 API 端点，默认 `https://api.anthropic.com`）
+- 可选：`DIGEST_OUTPUT_DIR`（自定义输出目录，默认 `./output`）
 - 网络访问（需要能访问 RSS 源和 AI API）
 
 ---
@@ -227,11 +245,11 @@ EOF
 
 ### "ANTHROPIC_API_KEY not set"
 
-需要提供 Anthropic API Key，可在 https://v3.codesome.cn 获取。
+需要提供 Anthropic API Key，可在 https://console.anthropic.com 获取。
 
-### "Anthropic 配额超限或请求失败"
+### "Anthropic API error"
 
-脚本会自动降级到 OpenAI 兼容接口（需提供 `OPENAI_API_KEY`，可选 `OPENAI_API_BASE`）。
+检查 API Key 是否有效、是否有足够配额。可通过设置 `ANTHROPIC_API_BASE` 环境变量使用自定义端点。
 
 ### "Failed to fetch N feeds"
 

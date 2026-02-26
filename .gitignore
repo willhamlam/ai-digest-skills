@@ -1,0 +1,24 @@
+# Dependencies
+node_modules/
+
+# Output / generated digests
+output/
+
+# Logs
+*.log
+
+# Environment variables
+.env
+.env.*
+
+# OS
+.DS_Store
+
+# Claude Code
+.claude/
+
+# User config
+.hn-daily-digest/
+
+# Generated images
+generated_imgs/
